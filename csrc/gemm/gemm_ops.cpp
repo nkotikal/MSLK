@@ -128,8 +128,12 @@ TORCH_LIBRARY_IMPL(mslk, CUDA, m) {
 
 #ifdef USE_ROCM
   m.impl("f8f8f16_rowwise", f8f8f16_rowwise);
-  m.impl("f8f8bf16_rowwise_preshuffle", f8f8bf16_rowwise_preshuffle);
-  m.impl("f8f8f16_rowwise_preshuffle", f8f8bf16_rowwise_preshuffle);
+  // f8f8bf16_rowwise_preshuffle / f8f8f16_rowwise_preshuffle: dispatched to the
+  // FlyDSL kernel via torch.library.impl registered in
+  // mslk/gemm/flydsl/register.py (WP-G3 replaces the CK
+  // DeviceGemmMultiD_Xdl_CShuffle_V3_BPreshuffle path). Do NOT re-add a CK
+  // m.impl here — the Python registration is intentionally the sole CUDA impl
+  // and will raise if a CK binding shadows it.
   m.impl("f8f8bf16_rowwise_grouped_mm", f8f8bf16_rowwise_grouped_mm);
   // i8i8bf16 / i8i8bf16_dynamic: dispatched to Python Triton kernels via
   // torch.library.impl registered in mslk/gemm/triton/int8_gemm.py.
@@ -187,8 +191,9 @@ TORCH_LIBRARY_IMPL(mslk, CPU, m) {
 
 #ifdef USE_ROCM
   m.impl("f8f8f16_rowwise", f8f8f16_rowwise);
-  m.impl("f8f8bf16_rowwise_preshuffle", f8f8bf16_rowwise_preshuffle);
-  m.impl("f8f8f16_rowwise_preshuffle", f8f8bf16_rowwise_preshuffle);
+  // f8f8bf16_rowwise_preshuffle / f8f8f16_rowwise_preshuffle: FlyDSL-backed via
+  // torch.library.impl (mslk/gemm/flydsl/register.py). GPU-only op; no CPU
+  // fallback, matching the i8i8bf16 ROCm dispatch pattern.
   m.impl("f8f8bf16_rowwise_grouped_mm", f8f8bf16_rowwise_grouped_mm);
   // i8i8bf16 / i8i8bf16_dynamic: Python Triton dispatch; no CPU fallback
   // needed.

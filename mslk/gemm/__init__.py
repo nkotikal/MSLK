@@ -24,3 +24,7 @@ import torch._utils_internal  # noqa: E402
 torch._utils_internal.REQUIRES_SET_PYTHON_MODULE = False
 
 from . import _meta  # noqa: F401, E402
+
+# Bind the FlyDSL FP8 rowwise-preshuffle kernels to the mslk:: op names
+# (WP-G3: replaces the CK DeviceGemmMultiD_Xdl_CShuffle_V3_BPreshuffle path).
+from . import flydsl  # noqa: F401, E402
