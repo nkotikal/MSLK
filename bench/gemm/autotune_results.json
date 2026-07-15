@@ -1,0 +1,218 @@
+{
+  "1,1280,8192": {
+    "us": 9.43,
+    "tflops": 2.2,
+    "tile_m": 16,
+    "tile_n": 64,
+    "tile_k": 512,
+    "lds_stage": 1,
+    "use_async_copy": false
+  },
+  "1,8192,1024": {
+    "us": 4.16,
+    "tflops": 4.0,
+    "tile_m": 16,
+    "tile_n": 64,
+    "tile_k": 256,
+    "lds_stage": 1,
+    "use_async_copy": true
+  },
+  "1,7168,8192": {
+    "us": 19.71,
+    "tflops": 6.0,
+    "tile_m": 16,
+    "tile_n": 64,
+    "tile_k": 512,
+    "lds_stage": 2,
+    "use_async_copy": false
+  },
+  "1,8192,3584": {
+    "us": 10.74,
+    "tflops": 5.5,
+    "tile_m": 16,
+    "tile_n": 64,
+    "tile_k": 512,
+    "lds_stage": 2,
+    "use_async_copy": false
+  },
+  "16,1280,8192": {
+    "us": 9.91,
+    "tflops": 33.8,
+    "tile_m": 16,
+    "tile_n": 64,
+    "tile_k": 512,
+    "lds_stage": 1,
+    "use_async_copy": false
+  },
+  "16,8192,1024": {
+    "us": 4.25,
+    "tflops": 63.2,
+    "tile_m": 16,
+    "tile_n": 128,
+    "tile_k": 256,
+    "lds_stage": 1,
+    "use_async_copy": true
+  },
+  "16,7168,8192": {
+    "us": 21.39,
+    "tflops": 87.9,
+    "tile_m": 16,
+    "tile_n": 64,
+    "tile_k": 512,
+    "lds_stage": 1,
+    "use_async_copy": true
+  },
+  "16,8192,3584": {
+    "us": 11.34,
+    "tflops": 82.8,
+    "tile_m": 16,
+    "tile_n": 64,
+    "tile_k": 512,
+    "lds_stage": 2,
+    "use_async_copy": false
+  },
+  "32,1280,8192": {
+    "us": 10.44,
+    "tflops": 64.3,
+    "tile_m": 16,
+    "tile_n": 64,
+    "tile_k": 512,
+    "lds_stage": 1,
+    "use_async_copy": false
+  },
+  "32,8192,1024": {
+    "us": 5.56,
+    "tflops": 96.5,
+    "tile_m": 32,
+    "tile_n": 64,
+    "tile_k": 512,
+    "lds_stage": 1,
+    "use_async_copy": true
+  },
+  "32,7168,8192": {
+    "us": 22.87,
+    "tflops": 164.3,
+    "tile_m": 32,
+    "tile_n": 64,
+    "tile_k": 512,
+    "lds_stage": 2,
+    "use_async_copy": false
+  },
+  "32,8192,3584": {
+    "us": 13.13,
+    "tflops": 143.2,
+    "tile_m": 32,
+    "tile_n": 64,
+    "tile_k": 512,
+    "lds_stage": 1,
+    "use_async_copy": true
+  },
+  "64,1280,8192": {
+    "us": 12.97,
+    "tflops": 103.5,
+    "tile_m": 32,
+    "tile_n": 64,
+    "tile_k": 512,
+    "lds_stage": 1,
+    "use_async_copy": true
+  },
+  "64,8192,1024": {
+    "us": 5.8,
+    "tflops": 185.1,
+    "tile_m": 64,
+    "tile_n": 64,
+    "tile_k": 256,
+    "lds_stage": 1,
+    "use_async_copy": true
+  },
+  "64,7168,8192": {
+    "us": 27.67,
+    "tflops": 271.6,
+    "tile_m": 64,
+    "tile_n": 64,
+    "tile_k": 512,
+    "lds_stage": 1,
+    "use_async_copy": true
+  },
+  "64,8192,3584": {
+    "us": 13.58,
+    "tflops": 276.7,
+    "tile_m": 64,
+    "tile_n": 64,
+    "tile_k": 512,
+    "lds_stage": 2,
+    "use_async_copy": false
+  },
+  "96,1280,8192": {
+    "us": 14.36,
+    "tflops": 140.2,
+    "tile_m": 32,
+    "tile_n": 64,
+    "tile_k": 512,
+    "lds_stage": 1,
+    "use_async_copy": true
+  },
+  "96,8192,1024": {
+    "us": 6.64,
+    "tflops": 242.7,
+    "tile_m": 64,
+    "tile_n": 64,
+    "tile_k": 256,
+    "lds_stage": 1,
+    "use_async_copy": true
+  },
+  "96,7168,8192": {
+    "us": 35.55,
+    "tflops": 317.1,
+    "tile_m": 64,
+    "tile_n": 64,
+    "tile_k": 512,
+    "lds_stage": 1,
+    "use_async_copy": false
+  },
+  "96,8192,3584": {
+    "us": 18.64,
+    "tflops": 302.5,
+    "tile_m": 64,
+    "tile_n": 64,
+    "tile_k": 512,
+    "lds_stage": 1,
+    "use_async_copy": false
+  },
+  "128,1280,8192": {
+    "us": 15.85,
+    "tflops": 169.4,
+    "tile_m": 32,
+    "tile_n": 64,
+    "tile_k": 512,
+    "lds_stage": 1,
+    "use_async_copy": true
+  },
+  "128,8192,1024": {
+    "us": 6.77,
+    "tflops": 317.2,
+    "tile_m": 64,
+    "tile_n": 64,
+    "tile_k": 256,
+    "lds_stage": 1,
+    "use_async_copy": true
+  },
+  "128,7168,8192": {
+    "us": 38.04,
+    "tflops": 395.1,
+    "tile_m": 64,
+    "tile_n": 64,
+    "tile_k": 512,
+    "lds_stage": 1,
+    "use_async_copy": false
+  },
+  "128,8192,3584": {
+    "us": 19.51,
+    "tflops": 385.3,
+    "tile_m": 64,
+    "tile_n": 64,
+    "tile_k": 512,
+    "lds_stage": 1,
+    "use_async_copy": false
+  }
+}
