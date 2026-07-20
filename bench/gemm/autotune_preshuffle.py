@@ -19,14 +19,25 @@ the driver resumes that shape from the config after the crasher.
 
 Runs standalone on ROCm; no compiled ``mslk.so`` required.
 
+Shape sets cover decode (M=1..128) and, via the ``*_full`` sets, prefill
+(M up to 16384) — matching the full M range CK's instances serve.
+
 Usage:
-    PYTHONPATH=<mslk-root> python bench/gemm/autotune_preshuffle.py \
-        [--model llama3_70b|llama4|llama3_405b|all] [--limit N] [--out results.json]
+    PYTHONPATH=<flydsl-root> python bench/gemm/autotune_preshuffle.py \
+        [--model llama3_70b|llama4|llama3_405b|
+                 llama3_70b_full|llama4_full|llama3_405b_full|all] \
+        [--limit N] [--wide] [--out results.json] \
+        [--baseline | --ck-profiler /path/to/ckProfiler]
+
+    --wide         also sweep waves_per_eu (closes the small residual regressions)
+    --baseline     quick CK proxy (aiter.gemm_a8w8_bpreshuffle)
+    --ck-profiler  true upstream-CK baseline (CK's own ckProfiler, all instances)
 """
 
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -57,33 +68,71 @@ from flydsl.runtime.device import get_rocm_arch  # noqa: E402
 ARCH = str(get_rocm_arch())
 DTYPE_FP8 = torch.float8_e4m3fn if "gfx95" in ARCH else torch.float8_e4m3fnuz
 
-TRIAL_TIMEOUT_S = 300
+TRIAL_TIMEOUT_S = 300      # per aiter/ckProfiler baseline call
+KGROUP_TIMEOUT_S = 1800    # per K-group worker window (resumes past crashes)
 
 # ── Shape sets (from bench/gemm/gemm_bench.py registry) ───────────────────────
+# M axis splits into decode (small, latency-bound) and prefill (large,
+# throughput-bound). CK's 65 instances cover both regimes, so "the preshuffle
+# shape set" in the ticket means decode *and* prefill — not just decode.
+_DECODE_M = (1, 16, 32, 64, 96, 128)
+_PREFILL_M = (256, 512, 1024, 2048, 4096, 8192, 16384)
+
+# (N, K) layer dims per model.
+_MODEL_NK = {
+    "llama3_70b": ((1280, 8192), (8192, 1024), (7168, 8192), (8192, 3584)),
+    "llama4": ((896, 5120), (5120, 640), (2048, 5120), (5120, 1024)),
+    "llama3_405b": ((13312, 6656), (13312, 16384), (16384, 6656), (16384, 16384)),
+}
+
+
+def _shapes(models, Ms):
+    out, seen = [], set()
+    for m in models:
+        for (N, K) in _MODEL_NK[m]:
+            for M in Ms:
+                t = (M, N, K)
+                if t not in seen:
+                    seen.add(t)
+                    out.append(t)
+    return out
+
+
 SHAPE_SETS = {
-    "llama3_70b": [(M, N, K) for M in (1, 16, 32, 64, 96, 128)
-                   for (N, K) in ((1280, 8192), (8192, 1024), (7168, 8192), (8192, 3584))],
-    "llama4": [(M, N, K) for M in (1, 16, 32, 64, 96, 128)
-               for (N, K) in ((896, 5120), (5120, 640), (2048, 5120), (5120, 1024))],
-    "llama3_405b": [(M, N, K) for M in (1, 16, 32, 64, 96, 128)
-                    for (N, K) in ((13312, 6656), (13312, 16384), (16384, 6656), (16384, 16384))],
+    # decode-only (original coverage)
+    "llama3_70b": _shapes(["llama3_70b"], _DECODE_M),
+    "llama4": _shapes(["llama4"], _DECODE_M),
+    "llama3_405b": _shapes(["llama3_405b"], _DECODE_M),
+    # decode + prefill (full M range CK covers)
+    "llama3_70b_full": _shapes(["llama3_70b"], _DECODE_M + _PREFILL_M),
+    "llama4_full": _shapes(["llama4"], _DECODE_M + _PREFILL_M),
+    "llama3_405b_full": _shapes(["llama3_405b"], _DECODE_M + _PREFILL_M),
 }
 
 
 # ── Step 3: constraint-based config grid ──────────────────────────────────────
 def _tile_m_choices(M):
+    # tile_m ladder capped near M; 256 is the largest tile the FlyDSL preload
+    # table supports, and it only pays off for prefill (M >> 128).
     nextpow2 = 1 << max(0, (M - 1)).bit_length()
-    cap = max(16, nextpow2)
-    return [t for t in (16, 32, 64, 128) if t <= cap]
+    cap = max(16, min(256, nextpow2))
+    return [t for t in (16, 32, 64, 128, 256) if t <= cap]
 
 
-def gen_configs(M, N, K):
-    """All valid (tile_m,tile_n,tile_k,lds_stage,use_async_copy) for this shape.
+def gen_configs(M, N, K, wide=False):
+    """All valid configs for this shape.
+
+    Config tuple: (tile_m, tile_n, tile_k, lds_stage, use_async_copy, waves_per_eu).
 
     fp8 (elem_bytes=1), 256 threads, 16B vector loads:
       tile_k % 64 == 0, (tile_m*tile_k) % 4096 == 0, (tile_n*tile_k) % 4096 == 0,
       N % tile_n == 0, K % tile_k == 0.
+
+    ``wide`` additionally sweeps ``waves_per_eu`` (occupancy hint). Preload depths
+    (dsrd/dvmem) are auto-derived per tile by the kernel, so they are not swept
+    here; ``wide`` is what the regression note means by "widen grid".
     """
+    wpes = (None,) if not wide else (None, 2, 4)
     cfgs = []
     for tm in _tile_m_choices(M):
         for tk in (128, 256, 512):
@@ -94,7 +143,8 @@ def gen_configs(M, N, K):
                     continue
                 for lds in (2, 1):
                     for aco in (False, True):
-                        cfgs.append((tm, tn, tk, lds, aco))
+                        for wpe in wpes:
+                            cfgs.append((tm, tn, tk, lds, aco, wpe))
     return cfgs
 
 
@@ -114,14 +164,24 @@ def _make_problem(M, N, K):
     return a_q.contiguous(), b_shuf, sa.view(-1).contiguous(), sb.view(-1).contiguous(), c_ref
 
 
-def _time_one(M, N, K, cfg, prob):
+# The compiled binary depends ONLY on (K, tile_m/n/k, lds, async, waves, dtype) —
+# M and N are runtime i32 kernel args (see kernels/preshuffle_gemm.py docstring:
+# "Runtime parameters: M, N"). So we compile ONCE per (K, cfg) and reuse the same
+# JitFunction across every (M, N) that shares that K — this is what avoids the
+# ~17x redundant recompiles the naive per-(M,N,K) loop was doing.
+def _compile(K, cfg, out_dtype="bf16"):
     from kernels.preshuffle_gemm import compile_preshuffle_gemm_a8
+    tm, tn, tk, lds, aco, wpe = cfg
+    return compile_preshuffle_gemm_a8(
+        M=0, N=0, K=K, tile_m=tm, tile_n=tn, tile_k=tk,
+        in_dtype="fp8", out_dtype=out_dtype,
+        lds_stage=lds, use_async_copy=aco, waves_per_eu=wpe)
+
+
+def _time_shape(fn, M, N, prob):
+    """Time an already-compiled kernel on one (M, N); None if numerically wrong."""
     from tests.test_common import run_perftest
-    tm, tn, tk, lds, aco = cfg
     a_q, b_shuf, sa, sb, c_ref = prob
-    fn = compile_preshuffle_gemm_a8(M=M, N=N, K=K, tile_m=tm, tile_n=tn, tile_k=tk,
-                                    in_dtype="fp8", out_dtype="bf16",
-                                    lds_stage=lds, use_async_copy=aco)
     c = torch.zeros((M, N), dtype=torch.bfloat16, device="cuda")
 
     def launch(c, a, b, x, w):
@@ -136,14 +196,57 @@ def _time_one(M, N, K, cfg, prob):
     return float(us)
 
 
-# ── Step 5: per-shape worker (streams "R <idx> <us|INCORRECT>", then "DONE") ───
+# ── Shape selection (identical in parent and worker so config indices line up) ─
+def _selected_shapes(model, limit):
+    if model == "all":
+        shapes, seen = [], set()
+        for s in SHAPE_SETS.values():
+            for t in s:
+                if t not in seen:
+                    seen.add(t); shapes.append(t)
+    else:
+        shapes = SHAPE_SETS[model]
+    return shapes[:limit] if limit else shapes
+
+
+def _mns_for_K(model, limit, K):
+    return [(M, N) for (M, N, Kk) in _selected_shapes(model, limit) if Kk == K]
+
+
+def _kgroup(K, mns, wide):
+    """Unique configs for this K + the (M,N) shapes each config applies to.
+
+    Compilation depends only on (K, cfg), so we tune per K: one compile serves
+    every (M,N) in the group. `gen_configs` already filters tile_m by M and
+    tile_n by N, so unioning per-shape configs yields exactly the applicable set.
+    """
+    order, seen, applies = [], set(), {}
+    for (M, N) in mns:
+        for cfg in gen_configs(M, N, K, wide=wide):
+            if cfg not in seen:
+                seen.add(cfg); order.append(cfg); applies[cfg] = []
+            applies[cfg].append((M, N))
+    return order, [applies[c] for c in order]
+
+
+# ── K-group worker: compile each config ONCE, time across all its (M,N) ────────
+# Streams "R <cfg_idx> <M> <N> <us|INCORRECT>" per timing, "C <cfg_idx>" when a
+# config's shapes are all done, then "DONE". A compile may hard-abort (LDS
+# overflow) — the parent resumes at the next config.
 def _worker(argv):
-    M, N, K, start = int(argv[0]), int(argv[1]), int(argv[2]), int(argv[3])
-    prob = _make_problem(M, N, K)
-    cfgs = gen_configs(M, N, K)
+    model, limit, K, start = argv[0], int(argv[1]), int(argv[2]), int(argv[3])
+    wide = bool(int(argv[4])) if len(argv) > 4 else False
+    mns = _mns_for_K(model, limit, K)
+    cfgs, applies = _kgroup(K, mns, wide)
+    prob_cache = {}
     for i in range(start, len(cfgs)):
-        us = _time_one(M, N, K, cfgs[i], prob)  # may hard-abort here (LDS overflow)
-        print(f"R {i} {us if us is not None else 'INCORRECT'}", flush=True)
+        fn = _compile(K, cfgs[i])  # may hard-abort here (LDS overflow)
+        for (M, N) in applies[i]:
+            if (M, N) not in prob_cache:
+                prob_cache[(M, N)] = _make_problem(M, N, K)
+            us = _time_shape(fn, M, N, prob_cache[(M, N)])
+            print(f"R {i} {M} {N} {us if us is not None else 'INCORRECT'}", flush=True)
+        print(f"C {i}", flush=True)
     print("DONE", flush=True)
     return 0
 
@@ -181,40 +284,80 @@ def _run_baseline(M, N, K):
     return None
 
 
-def _tune_shape(M, N, K, iters_note=""):
-    """Drive one shape across child processes, resuming past any crasher."""
-    cfgs = gen_configs(M, N, K)
-    results = {}  # idx -> us
-    crashed = []
+# ── Upstream-CK baseline: CK's own ckProfiler (sweeps ALL CK instances) ───────
+# This is the *true* upstream Composable Kernel path — it benchmarks whatever CK
+# version is checked out/built (including kernels newer than MSLK's frozen 65),
+# not aiter and not MSLK's precompiled dispatcher. Build once:
+#   cd mslk/external/composable_kernel && mkdir build && cd build
+#   cmake -DCMAKE_BUILD_TYPE=Release -DGPU_TARGETS=gfx942 \
+#         -DCMAKE_CXX_COMPILER=/opt/rocm/bin/hipcc .. && make ckProfiler -j
+# then pass --ck-profiler <build>/bin/ckProfiler.
+def _run_ck_profiler(M, N, K, ck_bin):
+    # ckProfiler gemm_universal_preshuffle <dtype> <layout> <verify> <init>
+    #   <log> <time> M N K StrideA StrideB StrideC KBatch [warmup iters rotMB]
+    # dtype=1 -> f8f8 bf16 out; layout=1 -> A[m,k]*B[n,k]=C[m,n] (MK_NK_MN);
+    # strides=-1 -> defaults; KBatch=1; verify=0; init=2 (decimal); time=1.
+    cmd = [ck_bin, "gemm_universal_preshuffle", "1", "1", "0", "2", "0", "1",
+           str(M), str(N), str(K), "-1", "-1", "-1", "1", "5", "20", "0"]
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=TRIAL_TIMEOUT_S)
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+    if p.returncode != 0:
+        return None
+    # CK prints per-instance "Perf: <ms> ms, ..." lines, then a summary
+    # "Best Perf for datatype = ... : <ms> ms, <TFlops> TFlops, ...".
+    best_ms = None
+    for line in p.stdout.splitlines():
+        m = re.search(r"[Bb]est\s+[Pp]erf.*?:\s*([0-9.eE+-]+)\s*ms", line)
+        if m:
+            best_ms = float(m.group(1))
+    return best_ms * 1000.0 if best_ms is not None else None  # ms -> us
+
+
+def _tune_kgroup(model, limit, K, wide=False):
+    """Tune every shape sharing this K in one pass, compiling each config once.
+
+    Drives child processes with resume-past-crash: a config that hard-aborts (or
+    exceeds the window) is skipped and the next config's compile continues. Each
+    completed config is marked "C <idx>" so the driver knows where to resume.
+
+    Returns best[(M,N)] = (us, cfg), plus (#configs, #crashed_or_skipped).
+    """
+    mns = _mns_for_K(model, limit, K)
+    cfgs, _applies = _kgroup(K, mns, wide)
+    best = {}  # (M,N) -> (us, cfg)
+    crashed = 0
     start = 0
+    env = {**os.environ, "PYTHONPATH": os.environ.get("PYTHONPATH", "")}
     while start < len(cfgs):
         cmd = [sys.executable, os.path.abspath(__file__), "--worker",
-               str(M), str(N), str(K), str(start)]
-        env = {**os.environ, "PYTHONPATH": os.environ.get("PYTHONPATH", "")}
-        last = start - 1
+               model, str(limit), str(K), str(start), str(int(wide))]
+        last_done = start - 1
         try:
             p = subprocess.run(cmd, capture_output=True, text=True,
-                               timeout=TRIAL_TIMEOUT_S, env=env)
+                               timeout=KGROUP_TIMEOUT_S, env=env)
             out = p.stdout
         except subprocess.TimeoutExpired as e:
             out = e.stdout.decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
         done = False
         for line in out.splitlines():
             if line.startswith("R "):
-                _, i, val = line.split(maxsplit=2)
-                i = int(i); last = i
+                _, i, M, N, val = line.split()
                 if val not in ("INCORRECT", "None"):
-                    results[i] = float(val)
+                    us = float(val); key = (int(M), int(N))
+                    if key not in best or us < best[key][0]:
+                        best[key] = (us, cfgs[int(i)])
+            elif line.startswith("C "):
+                last_done = int(line.split()[1])
             elif line.strip() == "DONE":
                 done = True
         if done:
             break
-        # process died after config `last`; the culprit is `last + 1`.
-        culprit = last + 1
-        if culprit < len(cfgs):
-            crashed.append(cfgs[culprit])
-        start = culprit + 1
-    return results, crashed, cfgs
+        crashed += 1
+        start = last_done + 2  # skip the config after the last fully-completed one
+    return best, len(cfgs), crashed
 
 
 def main():
@@ -223,55 +366,69 @@ def main():
                     choices=list(SHAPE_SETS) + ["all"])
     ap.add_argument("--limit", type=int, default=0, help="max shapes (0 = all)")
     ap.add_argument("--out", default="autotune_results.json")
+    ap.add_argument("--wide", action="store_true",
+                    help="widen the grid (sweep waves_per_eu) to close regressions")
     ap.add_argument("--baseline", action="store_true",
-                    help="also benchmark aiter.gemm_a8w8_bpreshuffle (CK-equivalent)")
+                    help="quick CK proxy via aiter.gemm_a8w8_bpreshuffle")
+    ap.add_argument("--ck-profiler", default=None, metavar="PATH",
+                    help="true upstream-CK baseline via CK ckProfiler binary "
+                         "(overrides --baseline; sweeps all CK instances)")
     args = ap.parse_args()
 
-    if args.model == "all":
-        shapes, seen = [], set()
-        for s in SHAPE_SETS.values():
-            for t in s:
-                if t not in seen:
-                    seen.add(t); shapes.append(t)
-    else:
-        shapes = SHAPE_SETS[args.model]
-    if args.limit:
-        shapes = shapes[: args.limit]
+    shapes = _selected_shapes(args.model, args.limit)
+    # Distinct K values, in first-seen order. We tune per K so each config
+    # compiles once and is reused across all (M,N) that share that K.
+    ks = list(dict.fromkeys(K for (_M, _N, K) in shapes))
 
-    print(f"# arch={ARCH} fp8={DTYPE_FP8} model={args.model} shapes={len(shapes)}", flush=True)
+    ck_mode = "upstream(ckProfiler)" if args.ck_profiler else \
+              "aiter" if args.baseline else "none"
+    print(f"# arch={ARCH} fp8={DTYPE_FP8} model={args.model} shapes={len(shapes)} "
+          f"K-groups={len(ks)} wide={args.wide} ck_baseline={ck_mode}", flush=True)
+
     table = {}
-    for (M, N, K) in shapes:
-        results, crashed, cfgs = _tune_shape(M, N, K)
-        n_ok = len(results)
-        if not results:
-            print(f"M={M:<4} N={N:<5} K={K:<5}: no valid config "
-                  f"({len(crashed)} crashed / {len(cfgs)} total)", flush=True)
-            continue
-        best_i = min(results, key=results.get)
-        best_us = results[best_i]
-        tm, tn, tk, lds, aco = cfgs[best_i]
-        tflops = 2 * M * N * K / (best_us / 1e6) / 1e12
-        entry = {
-            "us": round(best_us, 2), "tflops": round(tflops, 1),
-            "tile_m": tm, "tile_n": tn, "tile_k": tk,
-            "lds_stage": lds, "use_async_copy": aco,
-        }
-        ck_str = ""
-        if args.baseline:
-            ck_us = _run_baseline(M, N, K)
+
+    def _save():
+        with open(args.out, "w") as f:
+            json.dump(table, f, indent=2)
+
+    for K in ks:
+        mns = _mns_for_K(args.model, args.limit, K)
+        best, n_cfg, n_crash = _tune_kgroup(args.model, args.limit, K, wide=args.wide)
+        print(f"# K={K}: tuned {len(mns)} shapes over {n_cfg} unique configs "
+              f"({n_crash} crashed/skipped)", flush=True)
+        for (M, N) in mns:
+            if (M, N) not in best:
+                print(f"M={M:<5} N={N:<5} K={K:<5}: no valid config", flush=True)
+                continue
+            best_us, (tm, tn, tk, lds, aco, wpe) = best[(M, N)]
+            tflops = 2 * M * N * K / (best_us / 1e6) / 1e12
+            entry = {
+                "us": round(best_us, 2), "tflops": round(tflops, 1),
+                "tile_m": tm, "tile_n": tn, "tile_k": tk,
+                "lds_stage": lds, "use_async_copy": aco, "waves_per_eu": wpe,
+            }
+            ck_str = ""
+            ck_us = None
+            if args.ck_profiler:
+                ck_us = _run_ck_profiler(M, N, K, args.ck_profiler)
+                ck_src = "CK(upstream)"
+            elif args.baseline:
+                ck_us = _run_baseline(M, N, K)
+                ck_src = "CK(aiter)"
             if ck_us:
                 entry["ck_us"] = round(ck_us, 2)
+                entry["ck_source"] = ck_src
                 entry["speedup_vs_ck"] = round(ck_us / best_us, 2)
-                ck_str = f"  | CK {ck_us:6.1f} us -> {ck_us / best_us:.2f}x"
-            else:
+                ck_str = f"  | {ck_src} {ck_us:7.1f} us -> {ck_us / best_us:.2f}x"
+            elif ck_mode != "none":
                 ck_str = "  | CK n/a"
-        table[f"{M},{N},{K}"] = entry
-        print(f"M={M:<4} N={N:<5} K={K:<5}: BEST {best_us:7.1f} us ({tflops:5.1f} TF) "
-              f"tiles=({tm},{tn},{tk}) lds={lds} async={aco}  "
-              f"[{n_ok} ok / {len(crashed)} crashed / {len(cfgs)} total]{ck_str}", flush=True)
+            table[f"{M},{N},{K}"] = entry
+            _save()  # incremental: a kill preserves completed shapes
+            print(f"M={M:<5} N={N:<5} K={K:<5}: BEST {best_us:7.1f} us "
+                  f"({tflops:6.1f} TF) tiles=({tm},{tn},{tk}) lds={lds} "
+                  f"async={aco} wpe={wpe}{ck_str}", flush=True)
 
-    with open(args.out, "w") as f:
-        json.dump(table, f, indent=2)
+    _save()
     print(f"\n# wrote {len(table)} shape->config entries to {args.out}", flush=True)
     return 0
 
